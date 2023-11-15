@@ -1,0 +1,8 @@
+this repository has a bunch of utilities i use to expose various
+devices on homekit.
+
+they're quite specific to my set up and assume a lot, e.g. specific
+io boards for the raspberry pi, etc.
+
+while almost none of them are usable as they are, you might be able
+to tweak them to get something useful.
