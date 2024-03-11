@@ -1,5 +1,5 @@
-// command hklaxon implements a homekit security device, with
-// inputs (motion sensors, contact sensor) connected via as i2c.
+// command hklaxon implements a homekit security device, using motion and
+// contact sensors connected to the inputs on a sequent i2c card.
 package main
 
 import (
@@ -8,7 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"slices"
+	"strconv"
 	"time"
 
 	"github.com/brutella/hap"
@@ -34,27 +34,16 @@ const (
 )
 
 var (
-	inputs = []sensor{
-		newDoor("1"), newDoor("2"), newDoor("3"), newDoor("4"),
-		newDoor("5"), newMotion("1"), newMotion("2"), newMotion("3"),
-		newMotion("4"), newMotion("5"), newMotion("6"), newMotion("7"),
-		newMotion("8"), newMotion("9"), newMotion("10"), newMotion("11"),
-		newMotion("12"), newMotion("13"), newMotion("14"), newMotion("15"),
-		nil, nil, nil, nil,
-		nil, nil, nil, nil,
-		nil, nil, nil, nil,
-	}
-
-	disabledInputs = []int{5, 12, 14}
-
+	inputs     = make([]sensor, 32)
 	alarmState = alarmDisarm
-
-	acc = accessory.NewSecuritySystem(accessory.Info{Name: "sensors", Manufacturer: "aljammaz labs"})
+	acc        = accessory.NewSecuritySystem(accessory.Info{Name: "sensors", Manufacturer: "aljammaz labs"})
 )
 
 func main() {
 	log.SetFlags(0)
 	log.SetPrefix("")
+	doors := flag.Uint("doors", 0x0, "32 bit mask of the door sensor inputs")
+	motion := flag.Uint("motion", 0x0, "32 bit mask of the motion sensor inputs")
 	pin := flag.String("pin", "", "homekit pin")
 	statedir := flag.String("state", filepath.Join(os.Getenv("HOME"), "hk", filepath.Base(os.Args[0])), "state directory")
 	flag.Parse()
@@ -69,15 +58,18 @@ func main() {
 	sensors.inputboard = &i2c.Dev{Addr: deviceAddress + (0x07 ^ inputboard), Bus: b}
 	sensors.relayboard = &i2c.Dev{Addr: deviceAddress + (0x07 ^ relayboard), Bus: b}
 
-	for i := range inputs {
-		if inputs[i] == nil {
-			continue
+	for i := 0; i < 32; i++ {
+		if (*doors>>i)&1 == 1 {
+			inputs[i] = newDoor(strconv.Itoa(i))
+			acc.Ss = append(acc.Ss, inputs[i].service())
 		}
-		acc.Ss = append(acc.Ss, inputs[i].service())
-	}
-
-	for _, idx := range disabledInputs {
-		inputs[idx].update(true)
+		if (*motion>>i)&1 == 1 {
+			inputs[i] = newMotion(strconv.Itoa(i))
+			acc.Ss = append(acc.Ss, inputs[i].service())
+		}
+		if (*doors>>i)&1 == 1 && (*motion>>i)&1 == 1 {
+			log.Fatalf("input %d is both a door and a motion sensor. check your bit masks!", i)
+		}
 	}
 
 	acc.SecuritySystem.SecuritySystemCurrentState.SetValue(alarmState)
@@ -108,10 +100,6 @@ func pollSensors() {
 		}
 		for i := range inputs {
 			if inputs[i] == nil {
-				continue
-			}
-			// skip disconnected ones.
-			if slices.Contains(disabledInputs, i) {
 				continue
 			}
 

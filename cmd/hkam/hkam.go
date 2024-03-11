@@ -1,4 +1,4 @@
-// command hkam proxies rtsp cameras as homekit devices.
+// command hkam bridges rtsp cameras to homekit.
 //
 // this uses ffmpeg for snapshots and expects it in $PATH.
 package main
@@ -262,6 +262,85 @@ func newCamera(name, upstream string) *accessory.A {
 	c.mgmt.SetupEndpoints.OnValueRemoteUpdate(c.setup)
 	c.a.AddS(c.mgmt.S)
 
+	// HomeKit Secure Video things:
+	/*
+		// TODO RTPStreamManagement Active characteristic
+		//c.mgmt.AddC(c.mgmtActive.C)
+
+		// TODO Microphone service
+		c.a.AddS(c.microphone.S)
+
+		// TODO MotionSensor service
+		motion := service.NewMotionSensor()
+		c.a.AddS(motion.S)
+
+		// TOOD CameraOperatingMode service
+		opmode := service.New("21A")
+
+		snapshotActive := characteristic.NewBool("223")
+		snapshotActive.Permissions = []string{characteristic.PermissionRead, characteristic.PermissionWrite, characteristic.PermissionEvents, characteristic.PermissionTimedWrite}
+		snapshotActive.SetValue(true)
+		opmode.AddC(snapshotActive.C)
+
+		cameraActive := characteristic.NewBool("21B")
+		cameraActive.Permissions = []string{characteristic.PermissionRead, characteristic.PermissionWrite, characteristic.PermissionEvents, characteristic.PermissionTimedWrite}
+		cameraActive.SetValue(true)
+		opmode.AddC(cameraActive.C)
+
+		periodicSnapshotsActive := characteristic.NewBool("225")
+		periodicSnapshotsActive.Permissions = []string{characteristic.PermissionRead, characteristic.PermissionWrite, characteristic.PermissionEvents, characteristic.PermissionTimedWrite}
+		periodicSnapshotsActive.SetValue(true)
+		opmode.AddC(periodicSnapshotsActive.C)
+
+		c.a.AddS(opmode)
+		// TODO CameraEventRecordingManagement service
+		recmgmt := service.New("204")
+
+		supportedCameraRecConf := characteristic.NewBytes("205")
+		type MediaContainerParam struct {
+			FragmentLength uint32 `tlv8:"1"`
+		}
+		type MediaContainerConf struct {
+			MediaContainerType   byte                  `tlv8:"1"`
+			MediaContainerParams []MediaContainerParam `tlv8:"-"`
+		}
+		type CameraRecConf struct {
+			Prebuffer           uint32               `tlv8:"1"`
+			EventTriggerOptions uint64               `tlv8:"2"`
+			MediaContainerConfs []MediaContainerConf `tlv8:"-"`
+		}
+		supportedCameraRecConf.SetValue(must(tlv8.Marshal(CameraRecConf{
+			Prebuffer:           4000,
+			EventTriggerOptions: 0x01, // & 0x02
+			MediaContainerConfs: []MediaContainerConf{{
+				MediaContainerType: 0, // mp4
+				MediaContainerParams: []MediaContainerParam{{
+					FragmentLength: 4000,
+				}},
+			}},
+		})))
+		supportedCameraRecConf.SetValue(nil)
+		recmgmt.AddC(supportedCameraRecConf.C)
+
+		supportedVideoRecConf := characteristic.NewBytes("206")
+		//supportedVideoRecConf.SetValue(must(tlv8.Marshal(rtp.NewH264VideoCodecConfiguration())))
+		recmgmt.AddC(supportedVideoRecConf.C)
+
+		supportedAudioRecConf := characteristic.NewBytes("207")
+		//supportedAudioRecConf.SetValue(must(tlv8.Marshal(rtp.NewAacEldAudioCodecConfiguration())))
+		recmgmt.AddC(supportedAudioRecConf.C)
+
+		selectedVideoRecConf := characteristic.NewBytes("209")
+		recmgmt.AddC(selectedVideoRecConf.C)
+
+		recAudioActive := characteristic.NewInt("226")
+		recAudioActive.SetValue(1)
+		recmgmt.AddC(recAudioActive.C)
+
+		c.a.AddS(recmgmt)
+		// TODO DataStreamManagement service?
+	*/
+
 	return c.a
 }
 
@@ -431,7 +510,7 @@ func (s *stream) start(ctx context.Context, url string) {
 			}
 			return
 		}
-		// prepend sps & pps in case the camera doesn't, e.g. axis cameras.
+		// prepend sps & pps in case the camera doesn't, like axis cameras.
 		pp, err := enc.Encode(append([][]byte{h.SPS, h.PPS}, au...))
 		if err != nil {
 			log.Printf("err: %v", err)

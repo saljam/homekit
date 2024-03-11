@@ -1,8 +1,31 @@
-this repository has a bunch of utilities i use to expose various
-devices on homekit.
+this repository has a number of custom homekit accessory proxies to
+interface with other systems or older hardware. they're all written
+in go.
 
-they're quite specific to my set up and assume a lot, e.g. specific
-io boards for the raspberry pi, etc.
+hklaxon, hknock, and hkdoor use the relays and inputs on a sequent i2c
+on a raspberry pi. https://sequentmicrosystems.com/
 
-while almost none of them are usable as they are, you might be able
-to tweak them to get something useful.
+hkam: proxies regular rtsp cameras, e.g. axis ones, to homekit. this
+	doesn't reencode the h.264 stream so it's quite efficient.
+
+hknx: exposes knx devices as homekit accessories. knx is a european
+	building automation system.
+
+hklaxon: use motion and contact sensors (like in most traditional
+	burglar alarm systems) connected to the inputs on a sequent
+	card to expose a homekit security device,
+
+hknock: doorbell and gate opener to interface with an old school
+	videx intercom system.
+
+hkdoor: electric strike door opener.
+
+
+TODO
+
+hkam: 
+	- doorbell support
+	- audio out
+	- audio in
+	- remove ffmpeg dependency for snapshots
+	- implement homekit secure video

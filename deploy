@@ -8,3 +8,4 @@ dst="${2:-o}"
 ssh $dst sudo systemctl stop $cmd
 GOARCH=arm GOOS=linux go build -o ./out/ ./cmd/$cmd && scp ./out/$cmd $dst:bin/
 ssh $dst sudo systemctl start $cmd
+exec ssh $dst sudo journalctl -f -u $cmd

@@ -78,5 +78,4 @@ func setRelay(i int, v bool) {
 	if err := relay.Tx([]byte{registerOut, s}, nil); err != nil {
 		log.Printf("could not write value: %v", err)
 	}
-	return
 }
