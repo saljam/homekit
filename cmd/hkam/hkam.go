@@ -1,6 +1,6 @@
 // command hkam proxies rtsp cameras as homekit devices.
 //
-// this uses ffmpeg and expects it in $PATH.
+// this uses ffmpeg for snapshots and expects it in $PATH.
 package main
 
 import (
@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -17,15 +18,25 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/bluenviron/gortsplib/v4"
+	"github.com/bluenviron/gortsplib/v4/pkg/base"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
+	"github.com/bluenviron/gortsplib/v4/pkg/format/rtph264"
 	"github.com/brutella/hap"
 	"github.com/brutella/hap/accessory"
-	"github.com/brutella/hap/rtp"
+	"github.com/brutella/hap/characteristic"
+	hkrtp "github.com/brutella/hap/rtp"
 	"github.com/brutella/hap/service"
 	"github.com/brutella/hap/tlv8"
+	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
+	"github.com/pion/srtp/v3"
 )
 
 var (
@@ -42,15 +53,32 @@ func main() {
 
 	as := []*accessory.A{}
 	for i, url := range cameraURLs {
-		a := newRTSPCamera(fmt.Sprintf("cam-%d", i+1), url)
+		a := newCamera(fmt.Sprintf("%d", i+1), url)
 		a.Id = uint64(i + 2)
 		as = append(as, a)
 	}
 
-	bridge := accessory.NewBridge(accessory.Info{Name: "cams", Manufacturer: "aljammaz labs"}).A
+	id, err := os.ReadFile(path.Join(*statedir, "id"))
+	if errors.Is(err, os.ErrNotExist) {
+		n := rand.Int63n(10000)
+		id = strconv.AppendInt(id, n, 10)
+		err := os.MkdirAll(*statedir, 0755)
+		if err != nil {
+			log.Fatalf("could not make state dir: %v", err)
+		}
+		err = os.WriteFile(path.Join(*statedir, "id"), id, 0644)
+		if err != nil {
+			log.Fatalf("could not create unique name: %v", err)
+		}
+	}
+
+	bridge := accessory.NewBridge(accessory.Info{
+		Name:         "cams-" + string(id),
+		SerialNumber: "something",
+		Manufacturer: "aljammaz labs",
+	}).A
 	bridge.Id = 1
 
-	var err error
 	server, err = hap.NewServer(hap.NewFsStore(*statedir), bridge, as...)
 	if err != nil {
 		log.Fatalf("could not make hap server: %v", err)
@@ -192,115 +220,84 @@ func handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-type rtspProxy struct {
+type camera struct {
+	// streams is the map of live rtp streams.
 	sync.Mutex
+	streams map[string]*stream
+
 	// upstreamURL is the upstream rtsp:// video URL.
 	upstreamURL string
-	streams     map[string]*stream
-	mgmt        *service.CameraRTPStreamManagement
+
+	// homekit api objects.
+	a          *accessory.A
+	mgmt       *service.CameraRTPStreamManagement
+	mgmtActive *characteristic.Active
+	microphone *service.Microphone
 }
 
 type stream struct {
-	setup  rtp.SetupEndpoints
-	ssrc   int
-	ctx    context.Context
-	cancel func()
+	client  *gortsplib.Client
+	maxSize int
+	vconn   net.Conn
+	vssrc   uint32
+	vkey    []byte
+	ctx     context.Context
+	cancel  func()
 }
 
-func newRTSPCamera(name, upstream string) *accessory.A {
-	cam := accessory.NewCamera(accessory.Info{Name: name, Firmware: "0.0.1", Manufacturer: "aljammaz labs"})
-
-	c1 := rtspProxy{
+func newCamera(name, upstream string) *accessory.A {
+	c := camera{
 		upstreamURL: upstream,
 		streams:     map[string]*stream{},
-		mgmt:        cam.StreamManagement1,
+		a:           accessory.New(accessory.Info{Name: name, Firmware: "0.0.1", Manufacturer: "aljammaz labs"}, accessory.TypeIPCamera),
+		mgmt:        service.NewCameraRTPStreamManagement(),
+		mgmtActive:  characteristic.NewActive(),
+		microphone:  service.NewMicrophone(),
 	}
-	c1.mgmt.StreamingStatus.SetValue(mustTVL8Marshal(rtp.StreamingStatus{rtp.StreamingStatusAvailable}))
-	c1.mgmt.SupportedRTPConfiguration.SetValue(mustTVL8Marshal(rtp.NewConfiguration(rtp.CryptoSuite_AES_CM_128_HMAC_SHA1_80)))
-	c1.mgmt.SupportedVideoStreamConfiguration.SetValue(mustTVL8Marshal(rtp.DefaultVideoStreamConfiguration()))
-	c1.mgmt.SupportedAudioStreamConfiguration.SetValue(mustTVL8Marshal(rtp.DefaultAudioStreamConfiguration()))
-	c1.mgmt.SelectedRTPStreamConfiguration.OnValueRemoteUpdate(c1.selectRTPStreamConfig)
-	c1.mgmt.SetupEndpoints.OnValueUpdate(c1.setupEndpoints)
+	c.mgmt.StreamingStatus.SetValue(must(tlv8.Marshal(hkrtp.StreamingStatus{hkrtp.StreamingStatusAvailable})))
+	c.mgmt.SupportedRTPConfiguration.SetValue(must(tlv8.Marshal(hkrtp.NewConfiguration(hkrtp.CryptoSuite_AES_CM_128_HMAC_SHA1_80))))
+	c.mgmt.SupportedVideoStreamConfiguration.SetValue(must(tlv8.Marshal(hkrtp.DefaultVideoStreamConfiguration())))
+	c.mgmt.SupportedAudioStreamConfiguration.SetValue(must(tlv8.Marshal(hkrtp.DefaultAudioStreamConfiguration())))
+	c.mgmt.SelectedRTPStreamConfiguration.OnValueRemoteUpdate(c.selectStream)
+	c.mgmt.SetupEndpoints.OnValueRemoteUpdate(c.setup)
+	c.a.AddS(c.mgmt.S)
 
-	c2 := rtspProxy{
-		upstreamURL: upstream,
-		streams:     map[string]*stream{},
-		mgmt:        cam.StreamManagement2,
-	}
-	c2.mgmt.StreamingStatus.SetValue(mustTVL8Marshal(rtp.StreamingStatus{rtp.StreamingStatusAvailable}))
-	c2.mgmt.SupportedRTPConfiguration.SetValue(mustTVL8Marshal(rtp.NewConfiguration(rtp.CryptoSuite_AES_CM_128_HMAC_SHA1_80)))
-	c2.mgmt.SupportedVideoStreamConfiguration.SetValue(mustTVL8Marshal(rtp.DefaultVideoStreamConfiguration()))
-	c2.mgmt.SupportedAudioStreamConfiguration.SetValue(mustTVL8Marshal(rtp.DefaultAudioStreamConfiguration()))
-	c2.mgmt.SelectedRTPStreamConfiguration.OnValueRemoteUpdate(c2.selectRTPStreamConfig)
-	c2.mgmt.SetupEndpoints.OnValueUpdate(c2.setupEndpoints)
-
-	return cam.A
+	return c.a
 }
 
-func (c *rtspProxy) selectRTPStreamConfig(buf []byte) {
-	c.Lock()
-	defer c.Unlock()
-	var cfg rtp.StreamConfiguration
-	err := tlv8.Unmarshal(buf, &cfg)
-	if err != nil {
-		log.Printf("could not unmarshal tlv8: %s", err)
-		return
-	}
-
-	s := c.streams[string(cfg.Command.Identifier)]
-	b64 := base64.RawStdEncoding.EncodeToString
-
-	switch cfg.Command.Type {
-	case rtp.SessionControlCommandTypeStart:
-		log.Printf("start %s", b64(cfg.Command.Identifier))
-		ctx, cancel := context.WithCancel(s.ctx)
-		s.cancel = cancel
-		s.startStream(ctx, cfg, c.upstreamURL)
-	case rtp.SessionControlCommandTypeSuspend:
-		log.Printf("suspend %s", b64(cfg.Command.Identifier))
-	case rtp.SessionControlCommandTypeResume:
-		log.Printf("resume %s", b64(cfg.Command.Identifier))
-	case rtp.SessionControlCommandTypeReconfigure:
-		log.Printf("reconfigure %s", b64(cfg.Command.Identifier))
-	case rtp.SessionControlCommandTypeEnd:
-		log.Printf("stop %s", b64(cfg.Command.Identifier))
-		if s.cancel != nil {
-			s.cancel()
-		}
-		delete(c.streams, string(cfg.Command.Identifier))
-		c.mgmt.SetupEndpoints.Bytes.SetValue(mustTVL8Marshal(rtp.StreamingStatus{rtp.StreamingStatusAvailable}))
-	default:
-		log.Printf("unknown command: %d", cfg.Command.Type)
-	}
-}
-
-func (c *rtspProxy) setupEndpoints(new, old []byte, r *http.Request) {
-	if r == nil {
-		// why does this ever get called with a nil request?
-		return
-	}
-
-	var req rtp.SetupEndpoints
-	err := tlv8.Unmarshal(new, &req)
+func (c *camera) setup(buf []byte) {
+	var req hkrtp.SetupEndpoints
+	err := tlv8.Unmarshal(buf, &req)
 	if err != nil {
 		log.Printf("could not unmarshal tlv8: %v", err)
 		return
 	}
 
-	addr, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
-	ipaddr, _, err := net.SplitHostPort(addr.String())
+	log.Printf("setup endpoints %v", b64(req.SessionId))
+
+	dst := fmt.Sprintf("%v:%v", req.ControllerAddr.IPAddr, req.ControllerAddr.VideoRtpPort)
+
+	vconn, err := net.Dial("udp", dst)
 	if err != nil {
-		log.Printf("could parse local address (%v): %v", addr, err)
 		return
 	}
+	src := vconn.LocalAddr().String()
+	addr, port, err := net.SplitHostPort(src)
+	if err != nil {
+		log.Printf("could parse local address (%v): %v", port, err)
+		return
+	}
+	vp, _ := strconv.Atoi(port)
 
-	resp := rtp.SetupEndpointsResponse{
+	log.Printf("%s -> %s", src, dst)
+
+	resp := hkrtp.SetupEndpointsResponse{
 		SessionId: req.SessionId,
-		Status:    rtp.SessionStatusSuccess,
-		AccessoryAddr: rtp.Addr{
+		Status:    hkrtp.SessionStatusSuccess,
+		AccessoryAddr: hkrtp.Addr{
 			IPVersion:    req.ControllerAddr.IPVersion,
-			IPAddr:       ipaddr,
-			VideoRtpPort: req.ControllerAddr.VideoRtpPort,
+			IPAddr:       addr,
+			VideoRtpPort: uint16(vp),
 			AudioRtpPort: req.ControllerAddr.AudioRtpPort,
 		},
 		Video:     req.Video,
@@ -309,87 +306,211 @@ func (c *rtspProxy) setupEndpoints(new, old []byte, r *http.Request) {
 		SsrcAudio: rand.Int31(),
 	}
 
-	c.Lock()
-	defer c.Unlock()
-	c.streams[string(req.SessionId)] = &stream{
-		setup: req,
-		ssrc:  int(resp.SsrcVideo),
-		ctx:   context.Background(),
+	maxSize := 1226
+	if req.ControllerAddr.IPVersion == hkrtp.IPAddrVersionv4 {
+		maxSize = 1376
 	}
 
-	c.mgmt.SetupEndpoints.SetValue(mustTVL8Marshal(resp))
-}
-
-func (s *stream) startStream(ctx context.Context, cfg rtp.StreamConfiguration, url string) {
-	mtu := 1228
-	if s.setup.ControllerAddr.IPVersion == rtp.IPAddrVersionv4 {
-		mtu = 1378
-	}
-
-	profile := "baseline"
-	for _, p := range cfg.Video.CodecParams.Profiles {
-		if p.Id == rtp.VideoCodecProfileMain {
-			profile = "main"
-		}
-		if p.Id == rtp.VideoCodecProfileHigh {
-			profile = "high"
-		}
-	}
-
-	level := "3.1"
-	for _, p := range cfg.Video.CodecParams.Levels {
-		if p.Level == rtp.VideoCodecLevel3_2 {
-			level = "3.2"
-		}
-		if p.Level == rtp.VideoCodecLevel4 {
-			level = "4.0"
-		}
-	}
-
-	log.Printf("stream requested: (%s %s) %dfps %dx%d %dkb/s mtu:%d", profile, level, cfg.Video.Attributes.Framerate, cfg.Video.Attributes.Width, cfg.Video.Attributes.Height, cfg.Video.RTP.Bitrate, cfg.Video.RTP.MTU)
-
-	cmd := exec.CommandContext(ctx, "ffmpeg",
-		"-hide_banner",
-		"-rtsp_transport", "tcp",
-
-		// as is:
-		"-i", url,
-		"-c", "copy", "-an",
-
-		// axis:
-		//"-i", fmt.Sprintf("%s?videocodec=h264&videozstrength=off&fps=%d&h264profile=main&resolution=%dx%d", url, cfg.Video.Attributes.Framerate, cfg.Video.Attributes.Width, cfg.Video.Attributes.Height),
-		// saving in .ts then streaming that works...
-		// ffmpeg -y -use_wallclock_as_timestamps 1 -hide_banner -t 10s -rtsp_transport tcp -skip_frame nokey -i 'rtsp://.../axis-media/media.amp?resolution=1280x720' -codec:v copy codec.ts
-		//"-re", "-stream_loop", "-1", "-i", "/home/s/codec.ts",
-		//"-codec:v", "copy",
-
-		// reencode:
-		//"-i", fmt.Sprintf("%s?videocodec=h264&videozstrength=off&fps=%d&h264profile=high&resolution=%dx%d", url, cfg.Video.Attributes.Framerate, cfg.Video.Attributes.Width, cfg.Video.Attributes.Height),
-		//"-codec:v", "h264_v4l2m2m", "-pix_fmt", "yuv420p",
-		//"-video_size", fmt.Sprintf("%d:%d", cfg.Video.Attributes.Width, cfg.Video.Attributes.Height),
-		//"-framerate", fmt.Sprintf("%d", cfg.Video.Attributes.Framerate),
-		//"-b:v", fmt.Sprintf("%dk", cfg.Video.RTP.Bitrate),
-
-		"-f", "rtp",
-		"-payload_type", fmt.Sprintf("%d", cfg.Video.RTP.PayloadType),
-		"-ssrc", fmt.Sprintf("%d", s.ssrc),
-		"-srtp_out_suite", "AES_CM_128_HMAC_SHA1_80",
-		"-srtp_out_params", fmt.Sprintf("%s", s.setup.Video.SrtpKey()),
-		fmt.Sprintf("srtp://%s:%d?rtcpport=%d&pkt_size=%d&timeout=60", s.setup.ControllerAddr.IPAddr, s.setup.ControllerAddr.VideoRtpPort, s.setup.ControllerAddr.VideoRtpPort, mtu),
-	)
-	cmd.Stdout = os.Stdout
-	err := cmd.Start()
+	vkey, err := unb64(req.Video.SrtpKey())
 	if err != nil {
-		log.Printf("could not start ffmpeg process: %v", err)
 		return
 	}
-	go cmd.Wait()
+
+	c.Lock()
+	defer c.Unlock()
+	t := gortsplib.TransportTCP
+	c.streams[string(req.SessionId)] = &stream{
+		ctx: context.Background(),
+		client: &gortsplib.Client{
+			Transport: &t,
+		},
+		maxSize: maxSize,
+		vconn:   vconn,
+		vkey:    vkey,
+		vssrc:   uint32(resp.SsrcVideo),
+	}
+
+	c.mgmt.SetupEndpoints.SetValue(must(tlv8.Marshal(resp)))
 }
 
-func mustTVL8Marshal(v any) []byte {
-	buf, err := tlv8.Marshal(v)
+func (c *camera) selectStream(buf []byte) {
+	c.Lock()
+	defer c.Unlock()
+	var cfg hkrtp.StreamConfiguration
+	err := tlv8.Unmarshal(buf, &cfg)
+	if err != nil {
+		log.Printf("could not unmarshal tlv8: %s", err)
+		return
+	}
+
+	s, ok := c.streams[string(cfg.Command.Identifier)]
+	if !ok {
+		log.Printf("unknown id %s", b64(cfg.Command.Identifier))
+		return
+	}
+
+	switch cfg.Command.Type {
+	case hkrtp.SessionControlCommandTypeStart:
+		log.Printf("start %s", b64(cfg.Command.Identifier))
+		ctx, cancel := context.WithCancel(s.ctx)
+		s.cancel = cancel
+		s.start(ctx, c.upstreamURL)
+	case hkrtp.SessionControlCommandTypeSuspend:
+		log.Printf("suspend %s", b64(cfg.Command.Identifier))
+	case hkrtp.SessionControlCommandTypeResume:
+		log.Printf("resume %s", b64(cfg.Command.Identifier))
+	case hkrtp.SessionControlCommandTypeReconfigure:
+		log.Printf("reconfigure %s", b64(cfg.Command.Identifier))
+	case hkrtp.SessionControlCommandTypeEnd:
+		log.Printf("stop %s", b64(cfg.Command.Identifier))
+		if s.cancel != nil {
+			s.cancel()
+			s.client.Close()
+			s.vconn.Close()
+		}
+		delete(c.streams, string(cfg.Command.Identifier))
+	default:
+		log.Printf("unknown command: %d", cfg.Command.Type)
+	}
+}
+
+func (s *stream) start(ctx context.Context, url string) {
+	u, err := base.ParseURL(url)
+	if err != nil {
+		return
+	}
+
+	err = s.client.Start(u.Scheme, u.Host)
+	if err != nil {
+		return
+	}
+
+	desc, _, err := s.client.Describe(u)
+	if err != nil {
+		return
+	}
+
+	var h *format.H264
+	m := desc.FindFormat(&h)
+	if m == nil {
+		return
+	}
+
+	_, err = s.client.Setup(desc.BaseURL, m, 0, 0)
+	if err != nil {
+		return
+	}
+
+	dec, err := h.CreateDecoder()
+	if err != nil {
+		return
+	}
+
+	enc, err := h.CreateEncoder()
+	if err != nil {
+		return
+	}
+	enc.PacketizationMode = 1
+	enc.PayloadType = 99
+	enc.PayloadMaxSize = s.maxSize
+	enc.SSRC = &s.vssrc
+	enc.Init()
+
+	txctx, err := srtp.CreateContext(s.vkey[:16], s.vkey[16:], srtp.ProtectionProfileAes128CmHmacSha1_80, srtp.SRTPNoReplayProtection())
+	if err != nil {
+		return
+	}
+	lastReport := time.Now()
+	packetCount := uint32(0)
+	octetCount := uint32(0)
+	s.client.OnPacketRTP(m, h, func(pkt *rtp.Packet) {
+		au, err := dec.Decode(pkt)
+		if err != nil {
+			if err != rtph264.ErrNonStartingPacketAndNoPrevious && err != rtph264.ErrMorePacketsNeeded {
+				log.Printf("err: %v", err)
+			}
+			return
+		}
+		// prepend sps & pps in case the camera doesn't, e.g. axis cameras.
+		pp, err := enc.Encode(append([][]byte{h.SPS, h.PPS}, au...))
+		if err != nil {
+			log.Printf("err: %v", err)
+			return
+		}
+		buf := make([]byte, 1500) // TODO pool bufs
+		for _, p := range pp {
+			p.Header.Timestamp = pkt.Header.Timestamp
+			pbuf, err := p.Marshal()
+			if err != nil {
+				log.Printf("error encoding rtp packet: %v", err)
+				s.client.Close()
+				return
+			}
+			buf, err = txctx.EncryptRTP(buf, pbuf, &p.Header)
+			if err != nil {
+				log.Printf("error encrypting rtp packet: %v", err)
+				s.client.Close()
+				return
+			}
+			_, err = s.vconn.Write(buf)
+			if err != nil {
+				log.Printf("error writing rtp packet: %v", err)
+				s.client.Close()
+				return
+			}
+			packetCount++
+			octetCount += uint32(len(p.Payload))
+		}
+
+		now := time.Now()
+		if now.Sub(lastReport) > 5*time.Second && len(pp) > 0 {
+			lastReport = now
+			sr := rtcp.SenderReport{
+				SSRC:        s.vssrc,
+				NTPTime:     uint64(time.Now().Unix()),
+				RTPTime:     pp[0].Header.Timestamp,
+				PacketCount: packetCount,
+				OctetCount:  octetCount,
+			}
+			b, err := sr.Marshal()
+			if err != nil {
+				log.Printf("error encoding rtcp packet: %v", err)
+				s.client.Close()
+				return
+			}
+			buf, err = txctx.EncryptRTCP(buf, b, nil)
+			if err != nil {
+				log.Printf("error encrypting rtcp packet: %v", err)
+				s.client.Close()
+				return
+			}
+			_, err = s.vconn.Write(buf)
+			if err != nil {
+				log.Printf("error writing rtcp packet: %v", err)
+				s.client.Close()
+				return
+			}
+
+		}
+	})
+
+	_, err = s.client.Play(nil)
+	if err != nil {
+		return
+	}
+
+	// discard incoming rtcp packets.
+	go io.Copy(io.Discard, s.vconn)
+}
+
+var (
+	b64   = base64.RawStdEncoding.EncodeToString
+	unb64 = base64.RawStdEncoding.DecodeString
+)
+
+func must[T any](v T, err error) T {
 	if err != nil {
 		panic(err)
 	}
-	return buf
+	return v
 }
