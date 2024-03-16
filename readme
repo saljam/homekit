@@ -24,7 +24,6 @@ hkdoor: electric strike door opener.
 TODO
 
 hkam: 
-	- doorbell support
 	- audio out
 	- audio in
 	- remove ffmpeg dependency for snapshots

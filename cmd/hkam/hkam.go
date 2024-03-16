@@ -4,10 +4,8 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,12 +13,11 @@ import (
 	"log"
 	"math/rand"
 	"net"
-	"net/http"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,7 +37,8 @@ import (
 )
 
 var (
-	server *hap.Server
+	server  *hap.Server
+	cameras []*camera
 )
 
 func main() {
@@ -49,13 +47,24 @@ func main() {
 	pin := flag.String("pin", "", "homekit pin")
 	statedir := flag.String("state", filepath.Join(os.Getenv("HOME"), "hk", filepath.Base(os.Args[0])), "state directory")
 	flag.Parse()
-	cameraURLs := flag.Args()
 
 	as := []*accessory.A{}
-	for i, url := range cameraURLs {
-		a := newCamera(fmt.Sprintf("%d", i+1), url)
-		a.Id = uint64(i + 2)
-		as = append(as, a)
+	for i, arg := range flag.Args() {
+		parts := strings.Split(arg, ",")
+		var url, doorbellevent, motionevent string
+		if len(parts) == 3 {
+			doorbellevent = parts[0]
+			motionevent = parts[1]
+			url = parts[2]
+		} else if len(parts) == 1 {
+			url = parts[0]
+		} else {
+			log.Fatalf("could not parse url %d: %v", i, arg)
+		}
+		c := newCamera(fmt.Sprintf("%d", i+1), url, motionevent, doorbellevent)
+		c.a.Id = uint64(i + 2)
+		as = append(as, c.a)
+		cameras = append(cameras, c)
 	}
 
 	id, err := os.ReadFile(path.Join(*statedir, "id"))
@@ -74,7 +83,7 @@ func main() {
 
 	bridge := accessory.NewBridge(accessory.Info{
 		Name:         "cams-" + string(id),
-		SerialNumber: "something",
+		SerialNumber: string(id),
 		Manufacturer: "aljammaz labs",
 	}).A
 	bridge.Id = 1
@@ -85,145 +94,17 @@ func main() {
 	}
 	server.Pin = *pin
 
-	snapshots.bufs = make([][]byte, len(cameraURLs))
-	snapshots.timestamps = make([]time.Time, len(cameraURLs))
-	snapshots.fetch = make(chan struct{})
-	go pollSnapshots(cameraURLs)
 	server.ServeMux().HandleFunc("/resource", handleSnapshot)
 
 	log.Fatal(server.ListenAndServe(context.Background()))
 }
 
-var snapshots struct {
-	sync.Mutex
-	bufs       [][]byte
-	timestamps []time.Time
-
-	fetch chan struct{}
-}
-
-func pollSnapshots(cameraURLs []string) {
-	go func() {
-		snapshots.fetch <- struct{}{}
-		for range time.Tick(5 * time.Minute) {
-			snapshots.fetch <- struct{}{}
-		}
-	}()
-
-	for range snapshots.fetch {
-		log.Printf("refreshing snapshots")
-		bufs := make([][]byte, len(cameraURLs))
-		for i, u := range cameraURLs {
-			b, err := fetchSnapshot(u)
-			if err != nil {
-				log.Printf("could not get snapshot for camera %v: %v", i, err)
-				continue
-			}
-			bufs[i] = b
-		}
-
-		snapshots.Lock()
-		for i := range bufs {
-			if bufs[i] != nil {
-				snapshots.bufs[i] = bufs[i]
-				snapshots.timestamps[i] = time.Now()
-			}
-		}
-		snapshots.Unlock()
-		log.Printf("refreshing snapshots: done")
-	}
-}
-
-func fetchSnapshot(u string) ([]byte, error) {
-	buf := &bytes.Buffer{}
-	cmd := exec.Command("ffmpeg",
-		"-rtsp_transport", "tcp",
-		"-i", u,
-		"-f", "image2",
-		"-frames:v", "1",
-		"-",
-	)
-	cmd.Stdout = buf
-	err := cmd.Run()
-	return buf.Bytes(), err
-}
-
-func handleSnapshot(w http.ResponseWriter, r *http.Request) {
-	if !server.IsAuthorized(r) {
-		hap.JsonError(w, hap.JsonStatusInsufficientPrivileges)
-		return
-	}
-
-	if r.Method != http.MethodPost {
-		http.Error(w, "unexpected method", http.StatusBadRequest)
-		return
-	}
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		log.Printf("/resource: could not read body: %v", err)
-		http.Error(w, "could not read body", http.StatusInternalServerError)
-		return
-	}
-
-	msg := struct {
-		AID    int    `json:"aid"`
-		Type   string `json:"resource-type"`
-		Width  int    `json:"image-width"`
-		Height int    `json:"image-height"`
-	}{}
-
-	err = json.Unmarshal(body, &msg)
-	if err != nil {
-		log.Printf("/resource: could not parse body: %v", err)
-		http.Error(w, "could not read body", http.StatusInternalServerError)
-		return
-	}
-
-	if msg.Type != "image" {
-		log.Printf("/resource: unexpected type: %v", msg.Type)
-		http.Error(w, "unexpected type", http.StatusBadRequest)
-		return
-	}
-
-	// ID 1 is the bridge
-	// IDs 2 onwards are our devices
-	index := msg.AID - 2
-	if !(0 <= index && index < len(snapshots.bufs)) {
-		log.Printf("/resource: unknown accessory id: %v", msg.AID)
-		http.Error(w, "unexpected id", http.StatusBadRequest)
-		return
-	}
-
-	snapshots.Lock()
-	buf := snapshots.bufs[index]
-	ts := snapshots.timestamps[index]
-	snapshots.Unlock()
-
-	if time.Since(ts) > 5*time.Second {
-		select {
-		case snapshots.fetch <- struct{}{}:
-		default:
-		}
-	}
-
-	if buf == nil {
-		http.Error(w, "not found", http.StatusNotFound)
-		log.Printf("no snapshot for %v", msg.AID)
-		return
-	}
-	w.Header().Set("Last-Modified", ts.Format(http.TimeFormat))
-	chunked := hap.NewChunkedWriter(w, 2048)
-	_, err = chunked.Write(buf)
-	if err != nil {
-		log.Printf("could write image: %v", err)
-	}
-}
-
 type camera struct {
 	// streams is the map of live rtp streams.
 	sync.Mutex
-	streams map[string]*stream
+	streams      map[string]*stream
+	snapshot     []byte
+	snapshotTime time.Time
 
 	// upstreamURL is the upstream rtsp:// video URL.
 	upstreamURL string
@@ -233,6 +114,8 @@ type camera struct {
 	mgmt       *service.CameraRTPStreamManagement
 	mgmtActive *characteristic.Active
 	microphone *service.Microphone
+	doorbell   *service.Doorbell
+	motion     *service.MotionSensor
 }
 
 type stream struct {
@@ -245,34 +128,61 @@ type stream struct {
 	cancel  func()
 }
 
-func newCamera(name, upstream string) *accessory.A {
-	c := camera{
+func newCamera(name, upstream, motionevent, doorbellevent string) *camera {
+	c := &camera{
 		upstreamURL: upstream,
 		streams:     map[string]*stream{},
 		a:           accessory.New(accessory.Info{Name: name, Firmware: "0.0.1", Manufacturer: "aljammaz labs"}, accessory.TypeIPCamera),
 		mgmt:        service.NewCameraRTPStreamManagement(),
 		mgmtActive:  characteristic.NewActive(),
-		microphone:  service.NewMicrophone(),
 	}
 	c.mgmt.StreamingStatus.SetValue(must(tlv8.Marshal(hkrtp.StreamingStatus{hkrtp.StreamingStatusAvailable})))
 	c.mgmt.SupportedRTPConfiguration.SetValue(must(tlv8.Marshal(hkrtp.NewConfiguration(hkrtp.CryptoSuite_AES_CM_128_HMAC_SHA1_80))))
-	c.mgmt.SupportedVideoStreamConfiguration.SetValue(must(tlv8.Marshal(hkrtp.DefaultVideoStreamConfiguration())))
+	c.mgmt.SupportedVideoStreamConfiguration.SetValue(must(tlv8.Marshal(hkrtp.VideoStreamConfiguration{
+		Codecs: []hkrtp.VideoCodecConfiguration{
+			{
+				Type: hkrtp.VideoCodecType_H264,
+				Parameters: hkrtp.VideoCodecParameters{
+					Profiles: []hkrtp.VideoCodecProfile{
+						{hkrtp.VideoCodecProfileMain},
+					},
+					Levels: []hkrtp.VideoCodecLevel{
+						{hkrtp.VideoCodecLevel3_1},
+					},
+					Packetizations: []hkrtp.VideoCodecPacketization{
+						{hkrtp.VideoCodecPacketizationModeNonInterleaved},
+					},
+				},
+				Attributes: []hkrtp.VideoCodecAttributes{
+					{1920, 1080, 30}, // 1080p
+					{1280, 720, 30},  // 720p
+				},
+			},
+		},
+	})))
 	c.mgmt.SupportedAudioStreamConfiguration.SetValue(must(tlv8.Marshal(hkrtp.DefaultAudioStreamConfiguration())))
 	c.mgmt.SelectedRTPStreamConfiguration.OnValueRemoteUpdate(c.selectStream)
 	c.mgmt.SetupEndpoints.OnValueRemoteUpdate(c.setup)
 	c.a.AddS(c.mgmt.S)
 
+	if motionevent != "" {
+		c.motion = service.NewMotionSensor()
+		c.a.AddS(c.motion.S)
+	}
+
+	if doorbellevent != "" {
+		c.doorbell = service.NewDoorbell()
+		c.a.AddS(c.doorbell.S)
+
+		c.microphone = service.NewMicrophone()
+		//c.a.AddS(c.microphone.S)
+	}
+	go c.subscribe(motionevent, doorbellevent)
+
 	// HomeKit Secure Video things:
 	/*
 		// TODO RTPStreamManagement Active characteristic
 		//c.mgmt.AddC(c.mgmtActive.C)
-
-		// TODO Microphone service
-		c.a.AddS(c.microphone.S)
-
-		// TODO MotionSensor service
-		motion := service.NewMotionSensor()
-		c.a.AddS(motion.S)
 
 		// TOOD CameraOperatingMode service
 		opmode := service.New("21A")
@@ -341,7 +251,57 @@ func newCamera(name, upstream string) *accessory.A {
 		// TODO DataStreamManagement service?
 	*/
 
-	return c.a
+	return c
+}
+
+func (c *camera) subscribe(motionevent, doorbellevent string) {
+	if motionevent == "" && doorbellevent == "" {
+		return
+	}
+
+	oc, err := newONVIFClient(c.upstreamURL)
+	if err != nil {
+		log.Printf("onvif events disabled: %v", err)
+		return
+	}
+
+	for {
+		eventsURL, err := oc.GetServiceURL("http://www.onvif.org/ver10/events/wsdl")
+		if err != nil {
+			log.Printf("error pulling onvif events: %v", err)
+			time.Sleep(2 * time.Minute)
+			continue
+		}
+
+		pullpoint, err := oc.CreatePullPoint(eventsURL)
+		if err != nil {
+			log.Printf("error pulling onvif events: %v", err)
+			time.Sleep(2 * time.Minute)
+			continue
+		}
+
+	inner:
+		for {
+			state, err := oc.PullMessages(eventsURL, pullpoint)
+			if err != nil {
+				log.Printf("error pulling onvif events: %v", err)
+				time.Sleep(2 * time.Minute)
+				break inner
+			}
+			if motion, ok := state[motionevent]; ok {
+				log.Println("motion detected")
+				c.motion.MotionDetected.SetValue(motion)
+			}
+			if pressed, ok := state[doorbellevent]; ok && pressed {
+				//0 ”Single Press”
+				//1 ”Double Press”
+				//2 ”Long Press”
+				log.Println("doorbell pressed")
+				c.fetchSnapshot()
+				c.doorbell.ProgrammableSwitchEvent.SetValue(0)
+			}
+		}
+	}
 }
 
 func (c *camera) setup(buf []byte) {
