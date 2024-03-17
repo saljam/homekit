@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 
 	"github.com/brutella/hap"
 )
@@ -30,7 +31,7 @@ type GetProfilesResponse struct {
 }
 
 func (c *camera) getSnapshotURL() error {
-	oc, err := newONVIFClient(c.upstreamURL)
+	oc, err := newONVIFClient(c.hclient, c.upstreamURL)
 	if err != nil {
 		return err
 	}
@@ -65,7 +66,13 @@ func (c *camera) getSnapshotURL() error {
 		return err
 	}
 
-	c.snapshotURL = u.MediaURI
+	// copy credentials from onvif url
+	snapshotu, err := url.Parse(u.MediaURI)
+	if err != nil {
+		return err
+	}
+
+	c.snapshotURL = snapshotu.String()
 
 	return nil
 }
@@ -76,8 +83,7 @@ func (c *camera) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstream, err := http.Get(c.snapshotURL)
-
+	upstream, err := c.hclient.Get(c.snapshotURL)
 	if err != nil {
 		log.Printf("couldn't fetch snapshot: %v", err)
 		return

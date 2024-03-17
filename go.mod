@@ -5,6 +5,7 @@ go 1.21
 require (
 	github.com/bluenviron/gortsplib/v4 v4.8.0
 	github.com/brutella/hap v0.0.30
+	github.com/icholy/digest v0.1.15
 	github.com/korylprince/go-onvif v0.1.5
 	github.com/pion/rtcp v1.2.14
 	github.com/pion/rtp v1.8.3

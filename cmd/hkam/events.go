@@ -19,7 +19,7 @@ func (c *camera) subscribe(motionevent, doorbellevent string) {
 		return
 	}
 
-	oc, err := newONVIFClient(c.upstreamURL)
+	oc, err := newONVIFClient(c.hclient, c.upstreamURL)
 	if err != nil {
 		log.Printf("onvif events disabled: %v", err)
 		return
@@ -88,10 +88,19 @@ type GetServicesResponse struct {
 func (c *onvifClient) GetServiceURL(namespace string) (string, error) {
 	svcs := &GetServicesResponse{}
 	err := c.do(&Request{
-		URL:        fmt.Sprintf("http://%s/onvif/device_service", c.addr),
+		URL:        fmt.Sprintf("https://%s/onvif/device_service", c.addr),
 		Namespaces: namespaces,
 		Body:       &GetServices{IncludeCapability: false},
 	}, svcs)
+	if err != nil {
+		// fallback to plain http.
+		// TODO remove this once we accept onvif urls in config.
+		err = c.do(&Request{
+			URL:        fmt.Sprintf("http://%s/onvif/device_service", c.addr),
+			Namespaces: namespaces,
+			Body:       &GetServices{IncludeCapability: false},
+		}, svcs)
+	}
 	if err != nil {
 		return "", fmt.Errorf("could not complete operation: %w", err)
 	}
@@ -211,31 +220,33 @@ type Request struct {
 }
 
 type onvifClient struct {
-	addr     string
-	security *soap.Security
+	addr               string
+	username, password string
+	hclient            *http.Client
 }
 
-func newONVIFClient(u string) (*onvifClient, error) {
+func newONVIFClient(hclient *http.Client, u string) (*onvifClient, error) {
 	uu, err := url.Parse(u)
 	if err != nil {
 		return nil, fmt.Errorf("could not parse url (%v): %w", u, err)
 	}
 	c := &onvifClient{
-		addr: uu.Host,
+		addr:     uu.Host,
+		username: uu.User.Username(),
+		hclient:  hclient,
 	}
-	password, _ := uu.User.Password()
-	if uu.User.Username() != "" && password != "" {
-		s, err := soap.NewSecurity(uu.User.Username(), password)
-		if err != nil {
-			return nil, fmt.Errorf("could not create security header: %w", err)
-		}
-		c.security = s
-	}
+	c.password, _ = uu.User.Password()
 	return c, nil
 }
 
 func (c *onvifClient) do(request *Request, response any) error {
-	request.Header.Security = c.security
+	if c.username != "" && c.password != "" {
+		s, err := soap.NewSecurity(c.username, c.password)
+		if err != nil {
+			return fmt.Errorf("could not create security header: %w", err)
+		}
+		request.Header.Security = s
+	}
 	body, err := xml.Marshal(request.Body)
 	if err != nil {
 		return fmt.Errorf("could not marshal request: %w", err)
@@ -251,7 +262,7 @@ func (c *onvifClient) do(request *Request, response any) error {
 		return fmt.Errorf("could not marshal envelope: %w", err)
 	}
 
-	soapResp, err := http.Post(request.URL, "application/soap+xml", buf)
+	soapResp, err := c.hclient.Post(request.URL, "application/soap+xml", buf)
 	if err != nil {
 		return fmt.Errorf("could not POST request: %w", err)
 	}

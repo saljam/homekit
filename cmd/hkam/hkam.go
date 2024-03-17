@@ -5,11 +5,14 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"math/rand"
+	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -23,6 +26,7 @@ import (
 	hkrtp "github.com/brutella/hap/rtp"
 	"github.com/brutella/hap/service"
 	"github.com/brutella/hap/tlv8"
+	"github.com/icholy/digest"
 )
 
 var (
@@ -30,10 +34,16 @@ var (
 	cameras []*camera
 )
 
+var (
+	// TODO tofu self signed certs instead of this.
+	insecuretls bool
+)
+
 func main() {
 	log.SetFlags(0)
 	log.SetPrefix("")
 	pin := flag.String("pin", "", "homekit pin")
+	flag.BoolVar(&insecuretls, "insecure", false, "skip verifying tls certificates")
 	statedir := flag.String("state", filepath.Join(os.Getenv("HOME"), "hk", filepath.Base(os.Args[0])), "state directory")
 	flag.Parse()
 
@@ -106,6 +116,8 @@ type camera struct {
 	microphone *service.Microphone
 	doorbell   *service.Doorbell
 	motion     *service.MotionSensor
+
+	hclient *http.Client
 }
 
 func newCamera(name, upstream, motionevent, doorbellevent string) *camera {
@@ -115,7 +127,27 @@ func newCamera(name, upstream, motionevent, doorbellevent string) *camera {
 		a:           accessory.New(accessory.Info{Name: name, Firmware: "0.0.1", Manufacturer: "aljammaz labs"}, accessory.TypeIPCamera),
 		mgmt:        service.NewCameraRTPStreamManagement(),
 		mgmtActive:  characteristic.NewActive(),
+		hclient:     &http.Client{},
 	}
+
+	if insecuretls {
+		c.hclient.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+	}
+
+	u, err := url.Parse(upstream)
+	if err != nil {
+		log.Fatalf("cannot parse upstream url: %v", err)
+	}
+	if pwd, ok := u.User.Password(); ok {
+		c.hclient.Transport = &digest.Transport{
+			Username:  u.User.Username(),
+			Password:  pwd,
+			Transport: c.hclient.Transport,
+		}
+	}
+
 	c.mgmt.StreamingStatus.SetValue(must(tlv8.Marshal(hkrtp.StreamingStatus{hkrtp.StreamingStatusAvailable})))
 	c.mgmt.SupportedRTPConfiguration.SetValue(must(tlv8.Marshal(hkrtp.NewConfiguration(hkrtp.CryptoSuite_AES_CM_128_HMAC_SHA1_80))))
 	c.mgmt.SupportedVideoStreamConfiguration.SetValue(must(tlv8.Marshal(hkrtp.VideoStreamConfiguration{
@@ -173,7 +205,7 @@ func newCamera(name, upstream, motionevent, doorbellevent string) *camera {
 
 	// TODO lazily retry this if it fails, and respect lifetime parameters in
 	// the onvif response.
-	err := c.getSnapshotURL()
+	err = c.getSnapshotURL()
 	if err != nil {
 		log.Printf("could not get snapshot url for %v: %v", name, err)
 	}
