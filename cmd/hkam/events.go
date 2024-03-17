@@ -5,19 +5,70 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
+	"time"
 
 	"github.com/korylprince/go-onvif/soap"
 )
+
+func (c *camera) subscribe(motionevent, doorbellevent string) {
+	if motionevent == "" && doorbellevent == "" {
+		return
+	}
+
+	oc, err := newONVIFClient(c.upstreamURL)
+	if err != nil {
+		log.Printf("onvif events disabled: %v", err)
+		return
+	}
+
+	for {
+		eventsURL, err := oc.GetServiceURL("http://www.onvif.org/ver10/events/wsdl")
+		if err != nil {
+			log.Printf("error pulling onvif events: %v", err)
+			time.Sleep(2 * time.Minute)
+			continue
+		}
+
+		pullpoint, err := oc.CreatePullPoint(eventsURL)
+		if err != nil {
+			log.Printf("error pulling onvif events: %v", err)
+			time.Sleep(2 * time.Minute)
+			continue
+		}
+
+	inner:
+		for {
+			state, err := oc.PullMessages(eventsURL, pullpoint)
+			if err != nil {
+				log.Printf("error pulling onvif events: %v", err)
+				time.Sleep(2 * time.Minute)
+				break inner
+			}
+			if motion, ok := state[motionevent]; ok {
+				log.Println("motion detected")
+				c.motion.MotionDetected.SetValue(motion)
+			}
+			if pressed, ok := state[doorbellevent]; ok && pressed {
+				//0 ”Single Press”
+				//1 ”Double Press”
+				//2 ”Long Press”
+				log.Println("doorbell pressed")
+				c.doorbell.ProgrammableSwitchEvent.SetValue(0)
+			}
+		}
+	}
+}
 
 // lazily use one set of namespaces for all requests.
 var namespaces = soap.Namespaces{
 	"tev": "http://www.onvif.org/ver10/events/wsdl",
 	"wsa": "http://www.w3.org/2005/08/addressing",
 	"tds": "http://www.onvif.org/ver10/device/wsdl",
+	"trt": "http://www.onvif.org/ver10/media/wsdl",
 }
 
 type GetServices struct {
@@ -206,7 +257,7 @@ func (c *onvifClient) do(request *Request, response any) error {
 	}
 	defer soapResp.Body.Close()
 
-	respEnv := new(Envelope)
+	respEnv := new(soap.Envelope)
 	if err = xml.NewDecoder(soapResp.Body).Decode(respEnv); err != nil {
 		return fmt.Errorf("could not decode response: %w", err)
 	}
@@ -253,58 +304,4 @@ func (e *Envelope) MarshalXML(enc *xml.Encoder, start xml.StartElement) error {
 	}
 
 	return nil
-}
-
-// UnmarshalXML implements xml.Unmarshaler
-func (e *Envelope) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
-	if e.Namespaces == nil {
-		e.Namespaces = make(soap.Namespaces)
-	}
-	for _, attr := range start.Attr {
-		if strings.ToLower(attr.Name.Space) == "xmlns" {
-			e.Namespaces[attr.Name.Local] = attr.Value
-		}
-	}
-
-	// guarantee body is not nil
-	if e.Body == nil {
-		e.Body = new(soap.Body)
-	}
-
-	for {
-		tok, err := d.Token()
-		if err != nil {
-			return fmt.Errorf("could not decode token: %w", err)
-		}
-
-		switch t := tok.(type) {
-		case xml.StartElement:
-			if t.Name.Local == "Header" {
-				h := new(Header)
-				if err = d.DecodeElement(h, &t); err != nil {
-					return fmt.Errorf("could not decode header: %w", err)
-				}
-				e.Header = h
-			} else if t.Name.Local == "Body" {
-				b := new(soap.Body)
-				if err = d.DecodeElement(b, &t); err != nil {
-					return fmt.Errorf("could not decode body: %w", err)
-				}
-				e.Body = b
-				if e.Body.Fault != nil {
-					e.Body.Fault.Namespaces = e.Namespaces
-				}
-			} else {
-				return soap.UnexpectedTokenError(t.Name)
-			}
-		case xml.EndElement:
-			return nil
-		case xml.CharData:
-			if len(bytes.TrimSpace(t)) != 0 {
-				return soap.UnexpectedTokenTypeError{Token: tok}
-			}
-		default:
-			return soap.UnexpectedTokenTypeError{Token: tok}
-		}
-	}
 }

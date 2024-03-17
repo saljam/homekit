@@ -26,5 +26,4 @@ TODO
 hkam: 
 	- audio out
 	- audio in
-	- remove ffmpeg dependency for snapshots
 	- implement homekit secure video

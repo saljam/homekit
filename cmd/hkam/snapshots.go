@@ -1,36 +1,97 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
-	"os/exec"
-	"time"
 
 	"github.com/brutella/hap"
 )
 
-func (c *camera) fetchSnapshot() error {
-	buf := &bytes.Buffer{}
-	cmd := exec.Command("ffmpeg",
-		"-rtsp_transport", "tcp",
-		"-i", c.upstreamURL,
-		"-f", "image2",
-		"-frames:v", "1",
-		"-",
-	)
-	cmd.Stdout = buf
-	err := cmd.Run()
+type GetSnapshotURI struct {
+	XMLName      string `xml:"trt:GetSnapshotUri"`
+	ProfileToken string `xml:"trt:ProfileToken,omitempty"`
+}
+
+type GetSnapshotURIResponse struct {
+	MediaURI string `xml:"MediaUri>Uri"`
+}
+
+type GetProfiles struct {
+	XMLName string `xml:"trt:GetProfiles"`
+}
+
+type GetProfilesResponse struct {
+	Profiles []struct {
+		Token string `xml:"token,attr"`
+	} `xml:"Profiles"`
+}
+
+func (c *camera) getSnapshotURL() error {
+	oc, err := newONVIFClient(c.upstreamURL)
 	if err != nil {
 		return err
 	}
-	c.Lock()
-	defer c.Unlock()
-	c.snapshot = buf.Bytes()
-	c.snapshotTime = time.Now()
+
+	mediaURL, err := oc.GetServiceURL("http://www.onvif.org/ver10/media/wsdl")
+	if err != nil {
+		return err
+	}
+
+	p := &GetProfilesResponse{}
+	err = oc.do(&Request{
+		URL:        mediaURL,
+		Namespaces: namespaces,
+		Body:       &GetProfiles{},
+	}, p)
+	if err != nil {
+		return err
+	}
+	if len(p.Profiles) == 0 {
+		return errors.New("no profiles")
+	}
+
+	u := &GetSnapshotURIResponse{}
+	err = oc.do(&Request{
+		URL:        mediaURL,
+		Namespaces: namespaces,
+		Body: &GetSnapshotURI{
+			ProfileToken: p.Profiles[0].Token,
+		},
+	}, u)
+	if err != nil {
+		return err
+	}
+
+	c.snapshotURL = u.MediaURI
+
 	return nil
+}
+
+func (c *camera) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	log.Printf("snapshot: fetching for %v", c.snapshotURL)
+	if c.snapshotURL == "" {
+		return
+	}
+
+	upstream, err := http.Get(c.snapshotURL)
+
+	if err != nil {
+		log.Printf("couldn't fetch snapshot: %v", err)
+		return
+	}
+	defer upstream.Body.Close()
+
+	for k, v := range upstream.Header {
+		for _, vv := range v {
+			w.Header().Add(k, vv)
+		}
+	}
+	w.WriteHeader(upstream.StatusCode)
+	io.Copy(w, upstream.Body)
+	log.Printf("snapshot: fetching for %v", c.snapshotURL)
 }
 
 func handleSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -80,28 +141,5 @@ func handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cameras[index].Lock()
-	buf := cameras[index].snapshot
-	ts := cameras[index].snapshotTime
-	cameras[index].Unlock()
-
-	if time.Since(ts) > 8*time.Second {
-		cameras[index].fetchSnapshot()
-		cameras[index].Lock()
-		buf = cameras[index].snapshot
-		ts = cameras[index].snapshotTime
-		cameras[index].Unlock()
-	}
-
-	if buf == nil {
-		http.Error(w, "not found", http.StatusNotFound)
-		log.Printf("no snapshot for %v", msg.AID)
-		return
-	}
-	w.Header().Set("Last-Modified", ts.Format(http.TimeFormat))
-	chunked := hap.NewChunkedWriter(w, 2048)
-	_, err = chunked.Write(buf)
-	if err != nil {
-		log.Printf("could write image: %v", err)
-	}
+	cameras[index].handleSnapshot(w, r)
 }
