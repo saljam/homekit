@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -103,8 +104,8 @@ type camera struct {
 	sync.Mutex
 	streams map[string]*stream
 
-	// upstreamURL is the upstream rtsp:// video url.
-	upstreamURL string
+	// streamURL is the upstream rtsp:// video url.
+	streamURL string
 
 	// snapshotURL is the url to fetch jpeg snapshots from the camera.
 	snapshotURL string
@@ -117,17 +118,19 @@ type camera struct {
 	doorbell   *service.Doorbell
 	motion     *service.MotionSensor
 
-	hclient *http.Client
+	onvifAddr          string
+	username, password string
+	hclient            *http.Client
 }
 
 func newCamera(name, upstream, motionevent, doorbellevent string) *camera {
 	c := &camera{
-		upstreamURL: upstream,
-		streams:     map[string]*stream{},
-		a:           accessory.New(accessory.Info{Name: name, Firmware: "0.0.1", Manufacturer: "aljammaz labs"}, accessory.TypeIPCamera),
-		mgmt:        service.NewCameraRTPStreamManagement(),
-		mgmtActive:  characteristic.NewActive(),
-		hclient:     &http.Client{},
+		streamURL:  upstream,
+		streams:    map[string]*stream{},
+		a:          accessory.New(accessory.Info{Name: name, Firmware: "0.0.1", Manufacturer: "aljammaz labs"}, accessory.TypeIPCamera),
+		mgmt:       service.NewCameraRTPStreamManagement(),
+		mgmtActive: characteristic.NewActive(),
+		hclient:    &http.Client{},
 	}
 
 	if insecuretls {
@@ -140,12 +143,31 @@ func newCamera(name, upstream, motionevent, doorbellevent string) *camera {
 	if err != nil {
 		log.Fatalf("cannot parse upstream url: %v", err)
 	}
-	if pwd, ok := u.User.Password(); ok {
+	c.username = u.User.Username()
+	c.password, _ = u.User.Password()
+	if _, ok := u.User.Password(); ok {
 		c.hclient.Transport = &digest.Transport{
-			Username:  u.User.Username(),
-			Password:  pwd,
+			Username:  c.username,
+			Password:  c.password,
 			Transport: c.hclient.Transport,
 		}
+	}
+
+	// TODO lazily retry getStreamURL and getSnapshotURL if they fail, and respect lifetime
+	// parameters in the onvif response.
+	if u.Scheme == "http" || u.Scheme == "https" {
+		c.onvifAddr = upstream
+		err = c.getStreamURL()
+		if err != nil {
+			log.Printf("could not get stream url for %v: %v", name, err)
+		}
+	} else {
+		// backward compatible with rtsp://... arguments.
+		c.onvifAddr = fmt.Sprintf("https://%s/onvif/device_service", u.Host)
+	}
+	err = c.getSnapshotURL()
+	if err != nil {
+		log.Printf("could not get snapshot url for %v: %v", name, err)
 	}
 
 	c.mgmt.StreamingStatus.SetValue(must(tlv8.Marshal(hkrtp.StreamingStatus{hkrtp.StreamingStatusAvailable})))
@@ -202,13 +224,6 @@ func newCamera(name, upstream, motionevent, doorbellevent string) *camera {
 		//c.a.AddS(c.microphone.S)
 	}
 	go c.subscribe(motionevent, doorbellevent)
-
-	// TODO lazily retry this if it fails, and respect lifetime parameters in
-	// the onvif response.
-	err = c.getSnapshotURL()
-	if err != nil {
-		log.Printf("could not get snapshot url for %v: %v", name, err)
-	}
 
 	// HomeKit Secure Video things:
 	/*
@@ -284,6 +299,11 @@ func newCamera(name, upstream, motionevent, doorbellevent string) *camera {
 
 	return c
 }
+
+var (
+	b64   = base64.RawStdEncoding.EncodeToString
+	unb64 = base64.RawStdEncoding.DecodeString
+)
 
 func must[T any](v T, err error) T {
 	if err != nil {

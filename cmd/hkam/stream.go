@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/bluenviron/gortsplib/v4"
 	"github.com/bluenviron/gortsplib/v4/pkg/base"
+	"github.com/bluenviron/gortsplib/v4/pkg/description"
 	"github.com/bluenviron/gortsplib/v4/pkg/format"
 	"github.com/bluenviron/gortsplib/v4/pkg/format/rtph264"
 	hkrtp "github.com/brutella/hap/rtp"
@@ -20,11 +20,6 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/srtp/v3"
-)
-
-var (
-	b64   = base64.RawStdEncoding.EncodeToString
-	unb64 = base64.RawStdEncoding.DecodeString
 )
 
 type stream struct {
@@ -152,7 +147,7 @@ func (c *camera) selectStream(buf []byte) {
 		log.Printf("start %s", b64(cfg.Command.Identifier))
 		ctx, cancel := context.WithCancel(s.ctx)
 		s.cancel = cancel
-		s.start(ctx, c.upstreamURL)
+		s.start(ctx, c.streamURL)
 	case hkrtp.SessionControlCommandTypeSuspend:
 		log.Printf("suspend %s", b64(cfg.Command.Identifier))
 	case hkrtp.SessionControlCommandTypeResume:
@@ -188,13 +183,22 @@ func (s *stream) start(ctx context.Context, url string) {
 		return
 	}
 
+	s.proxyVideo(desc)
+
+	_, err = s.client.Play(nil)
+	if err != nil {
+		return
+	}
+}
+
+func (s *stream) proxyVideo(desc *description.Session) {
 	var h *format.H264
 	m := desc.FindFormat(&h)
 	if m == nil {
 		return
 	}
 
-	_, err = s.client.Setup(desc.BaseURL, m, 0, 0)
+	_, err := s.client.Setup(desc.BaseURL, m, 0, 0)
 	if err != nil {
 		return
 	}
@@ -229,6 +233,7 @@ func (s *stream) start(ctx context.Context, url string) {
 			}
 			return
 		}
+
 		// prepend sps & pps in case the camera doesn't, like axis cameras.
 		pp, err := enc.Encode(append([][]byte{h.SPS, h.PPS}, au...))
 		if err != nil {
@@ -292,11 +297,47 @@ func (s *stream) start(ctx context.Context, url string) {
 		}
 	})
 
-	_, err = s.client.Play(nil)
-	if err != nil {
-		return
-	}
-
 	// discard incoming rtcp packets.
 	go io.Copy(io.Discard, s.vconn)
+}
+
+type GetStreamURI struct {
+	XMLName      string `xml:"trt:GetStreamUri"`
+	ProfileToken string `xml:"trt:ProfileToken"`
+	Stream       string `xml:"trt:StreamSetup>tt:Stream"`
+	Protocol     string `xml:"trt:StreamSetup>tt:Transport>tt:Protocol"`
+}
+
+type GetStreamURIResponse struct {
+	MediaURI string `xml:"MediaUri>Uri"`
+}
+
+func (c *camera) getStreamURL() error {
+	mediaURL, err := c.GetServiceURL("http://www.onvif.org/ver10/media/wsdl")
+	if err != nil {
+		return err
+	}
+
+	token, err := c.GetProfile()
+	if err != nil {
+		return err
+	}
+
+	u := &GetStreamURIResponse{}
+	err = c.do(&Request{
+		URL:        mediaURL,
+		Namespaces: namespaces,
+		Body: &GetStreamURI{
+			ProfileToken: token,
+			Stream:       "RTP-Unicast",
+			Protocol:     "RTSP",
+		},
+	}, u)
+	if err != nil {
+		return err
+	}
+
+	c.streamURL = u.MediaURI
+
+	return nil
 }

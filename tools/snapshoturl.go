@@ -17,6 +17,12 @@ import (
 	"github.com/korylprince/go-onvif/soap"
 )
 
+func debugf(format string, a ...any) {
+	if debug, err := strconv.ParseBool(os.Getenv("DEBUG")); err == nil && debug {
+		log.Printf(format, a...)
+	}
+}
+
 func main() {
 	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	c, err := newONVIFClient(os.Args[1])
@@ -43,20 +49,38 @@ func main() {
 		log.Fatal("no profiles")
 	}
 
-	u := &GetSnapshotURIResponse{}
+	fmt.Printf("profiles:\n")
+	for i := range p.Profiles {
+		fmt.Printf("  %v\n", p.Profiles[i].Token)
+	}
+
+	u := &GetStreamURIResponse{}
 	err = c.do(&Request{
 		URL:        mediaURL,
 		Namespaces: namespaces,
-		Body: &GetSnapshotURI{
+		Body: &GetStreamURI{
 			ProfileToken: p.Profiles[0].Token,
+			Stream:       "RTP-Unicast",
+			Protocol:     "RTSP",
 		},
 	}, u)
-	log.Println(u.MediaURI)
+	log.Println(u.MediaURI, err)
+}
+
+type GetStreamURI struct {
+	XMLName      string `xml:"trt:GetStreamUri"`
+	ProfileToken string `xml:"trt:ProfileToken"`
+	Stream       string `xml:"trt:StreamSetup>tt:Stream"`
+	Protocol     string `xml:"trt:StreamSetup>tt:Transport>tt:Protocol"`
+}
+
+type GetStreamURIResponse struct {
+	MediaURI string `xml:"MediaUri>Uri"`
 }
 
 type GetSnapshotURI struct {
 	XMLName      string `xml:"trt:GetSnapshotUri"`
-	ProfileToken string `xml:"trt:ProfileToken,omitempty"`
+	ProfileToken string `xml:"trt:ProfileToken"`
 }
 
 type GetSnapshotURIResponse struct {
@@ -79,8 +103,7 @@ var namespaces = soap.Namespaces{
 	"wsa": "http://www.w3.org/2005/08/addressing",
 	"tds": "http://www.onvif.org/ver10/device/wsdl",
 	"trt": "http://www.onvif.org/ver10/media/wsdl",
-	//"wsse": "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd",
-	//"wsu":  "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd",
+	"tt":  "http://www.onvif.org/ver10/schema",
 }
 
 type GetServices struct {
@@ -265,7 +288,7 @@ func (c *onvifClient) do(request *Request, response any) error {
 		return fmt.Errorf("could not marshal envelope: %w", err)
 	}
 
-	//log.Println(buf.String())
+	debugf("\nrequest:\n%s", body)
 
 	soapResp, err := http.Post(request.URL, "application/soap+xml", buf)
 	if err != nil {
@@ -285,7 +308,7 @@ func (c *onvifClient) do(request *Request, response any) error {
 		return respEnv.Body.Fault
 	}
 
-	//log.Println(string(respEnv.Body.InnerXML))
+	debugf("\nrequest:\n%s", respEnv.Body.InnerXML)
 
 	return respEnv.Body.Unmarshal(response)
 }
