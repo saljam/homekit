@@ -7,6 +7,7 @@ import (
 	"flag"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"time"
@@ -37,6 +38,7 @@ var (
 	inputs     = make([]sensor, 32)
 	alarmState = alarmDisarm
 	acc        = accessory.NewSecuritySystem(accessory.Info{Name: "sensors", Manufacturer: "aljammaz labs"})
+	doorcmd    = ""
 )
 
 func main() {
@@ -45,6 +47,7 @@ func main() {
 	doors := flag.Uint("doors", 0x0, "32 bit mask of the door sensor inputs")
 	motion := flag.Uint("motion", 0x0, "32 bit mask of the motion sensor inputs")
 	pin := flag.String("pin", "", "homekit pin")
+	flag.StringVar(&doorcmd, "doorcmd", "", "command to run in a shell when a door is opened or closed")
 	statedir := flag.String("state", filepath.Join(os.Getenv("HOME"), "hk", filepath.Base(os.Args[0])), "state directory")
 	flag.Parse()
 
@@ -139,6 +142,22 @@ func (d *door) update(closed bool) {
 			updateAlarmState(alarmTriggered)
 		}
 	}
+	if doorcmd == "" {
+		return
+	}
+	go func() {
+		if closed {
+			err := exec.Command(doorcmd, d.name, "closed").Run()
+			if err != nil {
+				log.Printf("could not run doorcmd: %v", err)
+			}
+		} else {
+			err := exec.Command(doorcmd, d.name, "opened").Run()
+			if err != nil {
+				log.Printf("could not run doorcmd: %v", err)
+			}
+		}
+	}()
 }
 
 func newDoor(name string) *door {
