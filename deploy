@@ -6,6 +6,8 @@ cmd="${1:-hkam}"
 dst="${2:-o}"
 
 ssh $dst sudo systemctl stop $cmd
+ssh $dst sudo systemctl stop $cmd-internal || true
 GOARCH=arm GOOS=linux go build -o ./out/ ./cmd/$cmd && scp ./out/$cmd $dst:bin/
 ssh $dst sudo systemctl start $cmd
+ssh $dst sudo systemctl start $cmd-internal || true
 exec ssh $dst sudo journalctl -f -u $cmd
